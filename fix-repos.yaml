@@ -1,0 +1,14 @@
+---
+- name: Фикс репозиториев Ubuntu 20.04
+  hosts: all
+  become: yes
+  tasks:
+    - name: Замена archive на old-releases
+      ansible.builtin.replace:
+        path: /etc/apt/sources.list
+        regexp: 'http://(ru\.)?archive\.ubuntu\.com/ubuntu/'
+        replace: 'http://old-releases.ubuntu.com/ubuntu/'
+    
+    - name: Обновление apt
+      ansible.builtin.apt:
+        update_cache: yes

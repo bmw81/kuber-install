@@ -1,0 +1,59 @@
+---
+- name: Диагностика и исправление инициализации
+  hosts: master
+  become: yes
+  vars:
+    apiserver_ip: "192.168.122.240"
+    
+  tasks:
+    - name: 1. Проверка манифестов
+      ansible.builtin.shell:
+        cmd: |
+          echo "=== Манифесты ==="
+          ls -la /etc/kubernetes/manifests/ 2>/dev/null || echo "Манифесты не найдены"
+          echo ""
+          echo "=== Содержимое манифеста kube-apiserver ==="
+          cat /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null | head -20 || echo "Манифест не найден"
+      register: manifests_check
+
+    - name: 2. Проверка контейнеров
+      ansible.builtin.shell:
+        cmd: |
+          echo "=== Все контейнеры ==="
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a
+          echo ""
+          echo "=== Контейнеры control-plane ==="
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a | grep -E 'kube-apiserver|kube-controller|kube-scheduler|etcd'
+      register: containers_check
+      ignore_errors: yes
+
+    - name: 3. Проверка cgroups
+      ansible.builtin.shell:
+        cmd: |
+          echo "=== cgroup драйвер containerd ==="
+          grep -i systemdcgroup /etc/containerd/config.toml || echo "Не найден"
+          echo ""
+          echo "=== cgroup драйвер kubelet ==="
+          grep -i cgroupdriver /var/lib/kubelet/config.yaml || echo "Не найден"
+      register: cgroup_check
+
+    - name: 4. Проверка логов kubelet на ошибки
+      ansible.builtin.shell:
+        cmd: journalctl -u kubelet -n 100 --no-pager | grep -i -E "error|failed"
+      register: kubelet_errors
+      ignore_errors: yes
+
+    - name: 5. Вывод диагностики
+      ansible.builtin.debug:
+        msg: 
+          - "=== МАНИФЕСТЫ ==="
+          - "{{ manifests_check.stdout_lines }}"
+          - ""
+          - "=== КОНТЕЙНЕРЫ ==="
+          - "{{ containers_check.stdout_lines }}"
+          - ""
+          - "=== CGROUPS ==="
+          - "{{ cgroup_check.stdout_lines }}"
+          - ""
+          - "=== ОШИБКИ KUBELET ==="
+          - "{{ kubelet_errors.stdout_lines }}"

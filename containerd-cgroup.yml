@@ -1,0 +1,36 @@
+---
+- name: Настройка containerd cgroups
+  hosts: all
+  become: yes
+  tasks:
+    - name: 1. Создание директории containerd
+      ansible.builtin.file:
+        path: /etc/containerd
+        state: directory
+        mode: '0755'
+
+    - name: 2. Генерация конфигурации containerd
+      ansible.builtin.shell:
+        cmd: containerd config default > /etc/containerd/config.toml
+        creates: /etc/containerd/config.toml
+
+    - name: 3. Настройка SystemdCgroup
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: 4. Перезапуск containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+
+    - name: 5. Проверка настройки
+      ansible.builtin.shell:
+        cmd: grep SystemdCgroup /etc/containerd/config.toml
+      register: cgroup_check
+
+    - name: 6. Вывод результата
+      ansible.builtin.debug:
+        msg: "{{ cgroup_check.stdout }}"

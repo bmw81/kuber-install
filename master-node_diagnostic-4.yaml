@@ -1,0 +1,99 @@
+---
+- name: Исправление и запуск control-plane контейнеров
+  hosts: master
+  become: yes
+  
+  tasks:
+    - name: 1. Остановка kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: stopped
+
+    - name: 2. Исправление сервиса kubelet (удаление устаревшего флага)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kubelet.service
+        content: |
+          [Unit]
+          Description=kubelet: The Kubernetes Node Agent
+          After=containerd.service
+          Wants=containerd.service
+
+          [Service]
+          ExecStart=/usr/local/bin/kubelet \
+            --config=/var/lib/kubelet/config.yaml \
+            --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \
+            --fail-swap-on=false
+          Restart=always
+          RestartSec=10
+          StartLimitInterval=0
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: 3. Перезагрузка systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: 4. Исправление прав на манифесты
+      ansible.builtin.shell:
+        cmd: |
+          chmod 755 /etc/kubernetes/manifests
+          chmod 644 /etc/kubernetes/manifests/*.yaml
+          chown root:root /etc/kubernetes/manifests/*.yaml
+
+    - name: 5. Запуск kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: 6. Ожидание запуска контейнеров
+      ansible.builtin.wait_for:
+        timeout: 30
+
+    - name: 7. Проверка контейнеров
+      ansible.builtin.shell:
+        cmd: |
+          echo "=== Все контейнеры ==="
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a
+          echo ""
+          echo "=== Контейнеры control-plane ==="
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a | grep -E 'kube-apiserver|kube-controller|kube-scheduler|etcd'
+      register: final_check
+
+    - name: 8. Вывод результата
+      ansible.builtin.debug:
+        msg: "{{ final_check.stdout_lines }}"
+
+    - name: 9. Проверка кластера
+      ansible.builtin.shell:
+        cmd: |
+          export KUBECONFIG=/etc/kubernetes/admin.conf
+          kubectl get nodes
+          kubectl get pods -A
+      register: cluster_check
+      ignore_errors: yes
+
+    - name: 10. Вывод статуса кластера
+      ansible.builtin.debug:
+        msg: "{{ cluster_check.stdout_lines }}"
+      when: cluster_check is defined
+
+    - name: 11. Получение join-команды
+      ansible.builtin.shell:
+        cmd: kubeadm token create --print-join-command 2>/dev/null
+      register: join_command
+      ignore_errors: yes
+
+    - name: 12. Вывод join-команды
+      ansible.builtin.debug:
+        msg: |
+          ================================================
+          ✅ КЛАСТЕР УСПЕШНО ИНИЦИАЛИЗИРОВАН!
+          ================================================
+          
+          Команда для присоединения worker нод:
+          {{ join_command.stdout }}
+          
+          ================================================
+      when: join_command is success

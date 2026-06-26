@@ -1,0 +1,91 @@
+---
+- name: Исправление запуска control-plane контейнеров
+  hosts: master
+  become: yes
+  
+  tasks:
+    - name: 1. Остановка kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: stopped
+
+    - name: 2. Проверка манифестов
+      ansible.builtin.shell:
+        cmd: |
+          ls -la /etc/kubernetes/manifests/
+          for manifest in /etc/kubernetes/manifests/*.yaml; do
+            echo "=== $manifest ==="
+            head -5 "$manifest"
+          done
+      register: manifests_check
+
+    - name: 3. Вывод манифестов
+      ansible.builtin.debug:
+        msg: "{{ manifests_check.stdout_lines }}"
+
+    - name: 4. Обновление конфигурации kubelet
+      ansible.builtin.copy:
+        dest: /var/lib/kubelet/config.yaml
+        content: |
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          cgroupDriver: systemd
+          containerRuntimeEndpoint: unix:///var/run/containerd/containerd.sock
+          failSwapOn: false
+          staticPodPath: /etc/kubernetes/manifests
+          authentication:
+            anonymous:
+              enabled: false
+            webhook:
+              enabled: true
+          authorization:
+            mode: Webhook
+
+    - name: 5. Перезапуск containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+        daemon_reload: yes
+
+    - name: 6. Ожидание запуска containerd
+      ansible.builtin.wait_for:
+        timeout: 5
+
+    - name: 7. Запуск kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+        enabled: yes
+
+    - name: 8. Ожидание запуска контейнеров
+      ansible.builtin.wait_for:
+        timeout: 30
+
+    - name: 9. Проверка контейнеров
+      ansible.builtin.shell:
+        cmd: |
+          echo "=== Все контейнеры ==="
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a
+          echo ""
+          echo "=== Контейнеры control-plane ==="
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a | grep -E 'kube-apiserver|kube-controller|kube-scheduler|etcd' || echo "Контейнеры control-plane не найдены"
+      register: final_check
+
+    - name: 10. Вывод результата
+      ansible.builtin.debug:
+        msg: "{{ final_check.stdout_lines }}"
+
+    - name: 11. Проверка статуса API сервера
+      ansible.builtin.shell:
+        cmd: |
+          if [ -f /etc/kubernetes/admin.conf ]; then
+            export KUBECONFIG=/etc/kubernetes/admin.conf
+            kubectl get nodes
+          fi
+      register: api_check
+      ignore_errors: yes
+
+    - name: 12. Вывод API статуса
+      ansible.builtin.debug:
+        msg: "{{ api_check.stdout_lines }}"
+      when: api_check is defined

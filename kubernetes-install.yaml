@@ -1,0 +1,119 @@
+---
+- name: Установка Kubernetes компонентов (прямая загрузка)
+  hosts: all
+  become: yes
+  vars:
+    k8s_version: "v1.30.0"  # Можно изменить на нужную версию
+    k8s_download_url: "https://dl.k8s.io/release/{{ k8s_version }}/bin/linux/amd64"
+    
+  tasks:
+    - name: 0. Создание директорий для установки
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /usr/local/bin
+        - /opt/cni/bin
+
+    - name: 1. Загрузка и установка kubectl
+      ansible.builtin.get_url:
+        url: "{{ k8s_download_url }}/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: '0755'
+        force: no
+        timeout: 300
+
+    - name: 2. Загрузка и установка kubeadm
+      ansible.builtin.get_url:
+        url: "{{ k8s_download_url }}/kubeadm"
+        dest: /usr/local/bin/kubeadm
+        mode: '0755'
+        force: no
+        timeout: 300
+
+    - name: 3. Загрузка и установка kubelet
+      ansible.builtin.get_url:
+        url: "{{ k8s_download_url }}/kubelet"
+        dest: /usr/local/bin/kubelet
+        mode: '0755'
+        force: no
+        timeout: 300
+
+    - name: 4. Создание символических ссылок (для совместимости)
+      ansible.builtin.file:
+        src: "/usr/local/bin/{{ item }}"
+        dest: "/usr/bin/{{ item }}"
+        state: link
+      loop:
+        - kubectl
+        - kubeadm
+        - kubelet
+
+    - name: 5. Создание директории для конфигурации kubelet
+      ansible.builtin.file:
+        path: /var/lib/kubelet
+        state: directory
+        mode: '0755'
+        owner: root
+        group: root
+
+    - name: 6. Создание конфигурации kubelet
+      ansible.builtin.copy:
+        dest: /var/lib/kubelet/config.yaml
+        content: |
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          cgroupDriver: systemd
+          containerRuntimeEndpoint: unix:///var/run/containerd/containerd.sock
+          failSwapOn: false
+          authentication:
+            anonymous:
+              enabled: false
+            webhook:
+              enabled: true
+          authorization:
+            mode: Webhook
+
+    - name: 7. Создание systemd сервиса для kubelet
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kubelet.service
+        content: |
+          [Unit]
+          Description=kubelet: The Kubernetes Node Agent
+          Documentation=https://kubernetes.io/docs/home/
+          Wants=network-online.target
+          After=network-online.target containerd.service
+
+          [Service]
+          ExecStart=/usr/local/bin/kubelet
+          Restart=always
+          StartLimitInterval=0
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: 8. Включение и запуск сервиса kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        daemon_reload: yes
+        enabled: yes
+        state: started
+      register: kubelet_status
+
+    - name: 9. Проверка версий установленных компонентов
+      ansible.builtin.shell:
+        cmd: |
+          echo "=== kubectl version ==="
+          /usr/local/bin/kubectl version --client
+          echo "=== kubeadm version ==="
+          /usr/local/bin/kubeadm version
+          echo "=== kubelet version ==="
+          /usr/local/bin/kubelet --version
+      register: version_check
+      changed_when: false
+
+    - name: 10. Вывод версий
+      ansible.builtin.debug:
+        msg: "{{ version_check.stdout_lines }}"

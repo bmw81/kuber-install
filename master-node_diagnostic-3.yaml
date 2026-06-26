@@ -1,0 +1,86 @@
+---
+- name: Принудительное исправление запуска control-plane
+  hosts: master
+  become: yes
+  
+  tasks:
+    - name: 1. Остановка kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: stopped
+
+    - name: 2. Исправление прав на манифесты
+      ansible.builtin.shell:
+        cmd: |
+          chmod 755 /etc/kubernetes/manifests
+          chmod 644 /etc/kubernetes/manifests/*.yaml
+          chown root:root /etc/kubernetes/manifests/*.yaml
+
+    - name: 3. Проверка содержимого манифестов
+      ansible.builtin.shell:
+        cmd: |
+          for manifest in /etc/kubernetes/manifests/*.yaml; do
+            echo "=== Проверка $manifest ==="
+            head -10 "$manifest"
+            echo ""
+          done
+      register: manifests_content
+
+    - name: 4. Вывод манифестов
+      ansible.builtin.debug:
+        msg: "{{ manifests_content.stdout_lines }}"
+
+    - name: 5. Очистка старых контейнеров
+      ansible.builtin.shell:
+        cmd: |
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock rm -a 2>/dev/null || true
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock rmi --prune 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: 6. Перезапуск containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+
+    - name: 7. Ожидание запуска containerd
+      ansible.builtin.wait_for:
+        timeout: 5
+
+    - name: 8. Запуск kubelet с отладкой
+      ansible.builtin.shell:
+        cmd: |
+          nohup /usr/local/bin/kubelet \
+            --config=/var/lib/kubelet/config.yaml \
+            --container-runtime=remote \
+            --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \
+            --fail-swap-on=false \
+            --v=4 > /tmp/kubelet-debug.log 2>&1 &
+        creates: /tmp/kubelet-debug.log
+
+    - name: 9. Ожидание запуска контейнеров
+      ansible.builtin.wait_for:
+        timeout: 30
+
+    - name: 10. Проверка контейнеров
+      ansible.builtin.shell:
+        cmd: |
+          echo "=== Все контейнеры ==="
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a
+          echo ""
+          echo "=== Контейнеры control-plane ==="
+          crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a | grep -E 'kube-apiserver|kube-controller|kube-scheduler|etcd'
+          echo ""
+          echo "=== Логи kubelet (последние ошибки) ==="
+          tail -50 /tmp/kubelet-debug.log | grep -i -E "error|failed|static|manifest"
+      register: final_check
+      ignore_errors: yes
+
+    - name: 11. Вывод результата
+      ansible.builtin.debug:
+        msg: "{{ final_check.stdout_lines }}"
+
+    - name: 12. Восстановление сервиса kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        enabled: yes

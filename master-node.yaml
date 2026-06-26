@@ -1,0 +1,166 @@
+---
+- name: Инициализация Kubernetes кластера (с диагностикой)
+  hosts: master
+  become: yes
+  vars:
+    apiserver_ip: "192.168.122.240"
+    
+  tasks:
+    - name: 1. Проверка статуса containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: started
+      register: containerd_status
+
+    - name: 2. Проверка что containerd запущен
+      ansible.builtin.assert:
+        that:
+          - containerd_status.status.ActiveState == "active"
+        fail_msg: "Containerd не запущен! Проверьте: systemctl status containerd"
+
+    - name: 3. Проверка cgroup драйвера containerd
+      ansible.builtin.shell:
+        cmd: grep -i systemdcgroup /etc/containerd/config.toml || echo "SystemdCgroup = false"
+      register: cgroup_check
+
+    - name: 4. Настройка cgroup драйвера если нужно
+      ansible.builtin.shell:
+        cmd: |
+          if ! grep -q "SystemdCgroup = true" /etc/containerd/config.toml; then
+            sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+            systemctl restart containerd
+            sleep 5
+          fi
+      when: "'false' in cgroup_check.stdout"
+
+    - name: 5. Полная очистка перед инициализацией
+      ansible.builtin.shell:
+        cmd: |
+          kubeadm reset -f 2>/dev/null || true
+          rm -rf /etc/kubernetes/
+          rm -rf /var/lib/kubelet/
+          rm -rf /var/lib/etcd/
+          rm -rf /etc/cni/net.d/
+          rm -rf $HOME/.kube/config
+          systemctl stop kubelet 2>/dev/null || true
+          sleep 2
+      changed_when: false
+
+    - name: 6. Проверка свободных портов
+      ansible.builtin.shell:
+        cmd: |
+          for port in 6443 10250 10257 10259; do
+            if ss -tulpn | grep -q ":$port "; then
+              echo "Port $port is in use, killing process..."
+              fuser -k $port/tcp 2>/dev/null || true
+            fi
+          done
+      changed_when: false
+
+    - name: 7. Предварительная загрузка образов
+      ansible.builtin.shell:
+        cmd: |
+          kubeadm config images pull \
+            --kubernetes-version=v1.30.0
+      register: images_pull
+
+    - name: 8. Инициализация кластера (с увеличенным временем)
+      ansible.builtin.shell:
+        cmd: |
+          kubeadm init \
+            --apiserver-advertise-address={{ apiserver_ip }} \
+            --pod-network-cidr=10.244.0.0/16 \
+            --kubernetes-version=v1.30.0 \
+            --v=2
+        creates: /etc/kubernetes/admin.conf
+      register: kubeadm_init
+      timeout: 600
+      async: 700
+      poll: 10
+
+    - name: 9. Проверка успешности инициализации
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: 10. Если инициализация не удалась - диагностика
+      block:
+        - name: 10.1. Проверка статуса kubelet
+          ansible.builtin.shell:
+            cmd: systemctl status kubelet --no-pager
+          register: kubelet_status
+          ignore_errors: yes
+
+        - name: 10.2. Логи kubelet
+          ansible.builtin.shell:
+            cmd: journalctl -u kubelet -n 50 --no-pager
+          register: kubelet_logs
+          ignore_errors: yes
+
+        - name: 10.3. Проверка контейнеров
+          ansible.builtin.shell:
+            cmd: crictl --runtime-endpoint unix:///var/run/containerd/containerd.sock ps -a
+          register: containers
+          ignore_errors: yes
+
+        - name: 10.4. Вывод диагностики
+          ansible.builtin.debug:
+            msg:
+              - "=== Статус kubelet ==="
+              - "{{ kubelet_status.stdout_lines }}"
+              - "=== Логи kubelet (последние 50 строк) ==="
+              - "{{ kubelet_logs.stdout_lines }}"
+              - "=== Контейнеры ==="
+              - "{{ containers.stdout_lines }}"
+          when: not admin_conf.stat.exists
+
+      when: not admin_conf.stat.exists
+
+    - name: 11. Настройка kubectl
+      ansible.builtin.shell:
+        cmd: |
+          mkdir -p $HOME/.kube
+          cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+          chown $(id -u):$(id -g) $HOME/.kube/config
+      when: admin_conf.stat.exists
+
+    - name: 12. Проверка кластера
+      ansible.builtin.shell:
+        cmd: kubectl get nodes
+      register: nodes_status
+      when: admin_conf.stat.exists
+      ignore_errors: yes
+
+    - name: 13. Получение join-команды
+      ansible.builtin.shell:
+        cmd: kubeadm token create --print-join-command 2>/dev/null
+      register: join_command
+      when: admin_conf.stat.exists
+      ignore_errors: yes
+
+    - name: 14. Вывод результата
+      ansible.builtin.debug:
+        msg: |
+          {% if admin_conf.stat.exists %}
+          ================================================
+          ✅ КЛАСТЕР УСПЕШНО ИНИЦИАЛИЗИРОВАН!
+          ================================================
+          
+          Команда для присоединения worker нод:
+          {{ join_command.stdout }}
+          
+          ================================================
+          {% else %}
+          ================================================
+          ❌ ИНИЦИАЛИЗАЦИЯ НЕ УДАЛАСЬ
+          ================================================
+          
+          Проверьте диагностику выше.
+          
+          Ручная диагностика на master-ноде:
+          sudo systemctl status kubelet
+          sudo journalctl -u kubelet -n 50 --no-pager
+          sudo crictl ps -a
+          
+          ================================================
+          {% endif %}
